@@ -15,6 +15,21 @@
 *
 * In some cases, you may calibrate the SPI speed manually.
 *
+* --- Trigger / rate limit ---
+*  Every LED is a plain led_classdev, so the generic LED triggers work out of
+*  the box (CONFIG_LEDS_TRIGGERS), including the netdev trigger
+*  (CONFIG_LEDS_TRIGGER_NETDEV):
+*    echo netdev > /sys/class/leds/<led>/trigger
+*    echo eth0   > /sys/class/leds/<led>/device_name
+*    echo 1      > /sys/class/leds/<led>/link   (also: rx, tx, interval)
+*  A DT node may preselect a trigger with "linux,default-trigger".
+*
+*  Brightness changes no longer hit SPI directly: they only update the frame
+*  buffer and kick one delayed work. That work writes the whole chain at most
+*  max_update_hz times per second (module param, 0 = unlimited), so any number
+*  of LEDs blinking from triggers collapses into a bounded SPI write rate and
+*  the last requested state is always flushed (trailing edge).
+*
 *
 * --- Fixed for 5.10.x (gnu89/C90-strict) kernel build ---
 *  - moved ws2812_framebuf_t/ws2812_color_t typedefs above their first use
@@ -42,6 +57,9 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <linux/moduleparam.h>
 
 #include <linux/types.h>
 
@@ -111,6 +129,11 @@ typedef struct {
 } ws2812_framebuf_t;
 
 
+/* max full-chain SPI writes per second, 0 = unlimited */
+static unsigned int max_update_hz = 50;
+module_param(max_update_hz, uint, 0644);
+MODULE_PARM_DESC(max_update_hz, "max SPI frame updates per second (0 = unlimited, default 50)");
+
 struct driver_data {
   int num_leds;
 
@@ -122,7 +145,10 @@ struct driver_data {
   ws2812_framebuf_t* ws_opctx;
 
   struct spi_device *spi;
-  struct mutex mutex;
+  struct mutex mutex;               // protects frame buffer, led state and SPI
+
+  struct delayed_work flush_work;   // rate-limited frame flush
+  unsigned long last_flush;         // jiffies of the last SPI write
 
   struct list_head leds;
 };
@@ -144,7 +170,7 @@ struct wsled_data {
 #endif
 
   struct color24 color;              // calculated color
-  struct color24 origin_color;       // origin color is readonly
+  struct color24 origin_color;       // base color: DTS preset, updated by channel writes
   uint8_t lightness; // for HSL color space
 };
 
@@ -180,6 +206,7 @@ enum filter_type {
 /* ---- forward declarations (definition order below still matters for a
  *      couple of these, but this keeps callers happy regardless) ---- */
 static int ws2812_vleds_update(struct driver_data* drv);
+static void ws2812_vleds_request_update(struct driver_data* drv);
 static void ws2812_clear(ws2812_framebuf_t* frame, ws2812_color_t color);
 static void ws2812_set_pixel(ws2812_framebuf_t* frame, int index, ws2812_color_t color);
 
@@ -351,11 +378,40 @@ struct color24* dst, uint8_t lightness)
   hsl_to_rgb(h, s, l, &dst->r, &dst->g, &dst->b);
 }
 
+static struct wsled_data* __find_wsled(struct driver_data* drv,
+struct led_classdev* led, enum filter_type filter, int* index)
+{
+  struct wsled_data* _node;
+  int _i = 0;
+
+  list_for_each_entry(_node, &drv->leds, list) {
+    struct led_classdev* _cls;
+
+    switch(filter) {
+#ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
+      case filter_red_ch:   _cls = _node->cls_red;   break;
+      case filter_green_ch: _cls = _node->cls_green; break;
+      case filter_blue_ch:  _cls = _node->cls_blue;  break;
+#endif
+      case filter_main:
+      default:              _cls = _node->cls;       break;
+    }
+
+    if(_cls == led) {
+      *index = _i;
+      return _node;
+    }
+    ++_i;
+  }
+
+  return NULL;
+}
+
 static int __compare_set_brightness(struct led_classdev* led,
 enum led_brightness bright, enum filter_type filter)
 {
   struct driver_data* _drv_data = NULL;
-  int _index = 0, _ret = 0;
+  int _index = 0;
   struct wsled_data* _node = NULL;
 
   _drv_data = (struct driver_data*)dev_get_drvdata(led->dev->parent);
@@ -364,51 +420,45 @@ enum led_brightness bright, enum filter_type filter)
     return -ENODEV;
   }
 
-  #define search_set_wsled_channel(cls, _do) \
-    _index = 0; \
-    list_for_each_entry(_node, &_drv_data->leds, list) { \
-      if(_node->cls == led) _do \
-      ++_index; \
-    }
+  mutex_lock(&_drv_data->mutex);
+
+  _node = __find_wsled(_drv_data, led, filter, &_index);
+  if(!_node) {
+    mutex_unlock(&_drv_data->mutex);
+    return -ENODEV;
+  }
 
   switch(filter) {
 #ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
     case filter_red_ch:
-      search_set_wsled_channel(cls_red, {
-        _node->color.r = bright;
-        break;
-      });
+      _node->color.r = bright;
+      _node->origin_color.r = bright;
       break;
     case filter_green_ch:
-      search_set_wsled_channel(cls_green, {
-        _node->color.g = bright;
-        break;
-      });
+      _node->color.g = bright;
+      _node->origin_color.g = bright;
       break;
     case filter_blue_ch:
-      search_set_wsled_channel(cls_blue, {
-        _node->color.b = bright;
-        break;
-      });
+      _node->color.b = bright;
+      _node->origin_color.b = bright;
       break;
 #endif
     case filter_main:
-      list_for_each_entry(_node, &_drv_data->leds, list) {
-        if(_node->cls == led) {
-          _node->lightness = bright;
-          __set_lightness_color24(&_node->origin_color, &_node->color, _node->lightness);
-          break;
-        }
-      }
+    default:
+      _node->lightness = bright;
+      __set_lightness_color24(&_node->origin_color, &_node->color, _node->lightness);
       break;
   }
 
-  // update leds
+  // update the frame buffer only, SPI is written by the rate-limited worker
   ws2812_set_pixel(_drv_data->ws_opctx, _index,
     ws2812_rgb(_node->color.r, _node->color.g, _node->color.b));
-  _ret = ws2812_vleds_update(_drv_data);
 
-  return _ret;
+  mutex_unlock(&_drv_data->mutex);
+
+  ws2812_vleds_request_update(_drv_data);
+
+  return 0;
 }
 
 #ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
@@ -431,14 +481,53 @@ static int ws2812_vleds_get_lednum(struct device_node* node) {
   return _counter;
 }
 
+/* synchronous write, only for probe/remove paths */
 static int ws2812_vleds_update(struct driver_data* drv) {
 
   int _ret = 0;
   mutex_lock(&drv->mutex);
+  WRITE_ONCE(drv->last_flush, jiffies);
   _ret = spi_write(drv->spi, drv->tx_buffer.ptr, drv->tx_buffer.length);
   mutex_unlock(&drv->mutex);
 
   return _ret;
+}
+
+static void ws2812_vleds_flush(struct work_struct* work)
+{
+  struct driver_data* _drv = container_of(to_delayed_work(work),
+    struct driver_data, flush_work);
+  int _ret;
+
+  _ret = ws2812_vleds_update(_drv);
+  if(_ret)
+    dev_err_ratelimited(&_drv->spi->dev, "spi write failed: %d\n", _ret);
+}
+
+/*
+ * Ask for a frame flush. Safe to call at any rate from any LED/trigger:
+ * - idle for >= 1/max_update_hz: flush right away (leading edge)
+ * - otherwise: one flush is queued for the end of the window; further
+ *   requests while it is pending are no-ops (queue_delayed_work() returns
+ *   false), and that flush sends whatever the frame holds by then.
+ */
+static void ws2812_vleds_request_update(struct driver_data* drv)
+{
+  unsigned int _hz = READ_ONCE(max_update_hz);
+  unsigned long _interval, _now, _next, _delay = 0;
+
+  if(_hz) {
+    _interval = DIV_ROUND_UP(HZ, _hz);
+    _now = jiffies;
+    _next = READ_ONCE(drv->last_flush) + _interval;
+    if(time_before(_now, _next))
+      _delay = _next - _now;
+    // last_flush older than ~2^31 jiffies makes time_before() lie
+    if(_delay > _interval)
+      _delay = 0;
+  }
+
+  queue_delayed_work(system_wq, &drv->flush_work, _delay);
 }
 
 static int ws2812_vleds_probe(struct spi_device *spi)
@@ -466,6 +555,10 @@ static int ws2812_vleds_probe(struct spi_device *spi)
 
   // create mutex (5.10.x has no devm_mutex_init(), use plain mutex_init())
   mutex_init(&_drv_data->mutex);
+
+  // rate-limited flush worker
+  INIT_DELAYED_WORK(&_drv_data->flush_work, ws2812_vleds_flush);
+  _drv_data->last_flush = jiffies;
 
   // allocate tx buffer
   _drv_data->num_leds = _leds;
@@ -523,8 +616,8 @@ static int ws2812_vleds_probe(struct spi_device *spi)
     _ledcls->max_brightness = _max_brightness;
     _ledcls->dev = &spi->dev;
 
-    led_classdev_register(&spi->dev, _ledcls);
-    dev_info(&spi->dev, "registering led: %s\n", _label);
+    // optional: linux,default-trigger = "netdev"; (device_name is set via sysfs)
+    of_property_read_string(child, "linux,default-trigger", &_ledcls->default_trigger);
 
 #ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
     // create RGB sub-devices for this led
@@ -584,7 +677,7 @@ static int ws2812_vleds_probe(struct spi_device *spi)
     _ledctx->lightness = 0;
     __set_lightness_color24(&_ledctx->origin_color, &_ledctx->color, _ledctx->lightness);
 
-    // register RGB sub-devices after setting initial values
+    // fill the channel sub-devices before anything becomes visible
 #ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
     _ledcls_red->brightness = _color_r;
     _ledcls_green->brightness = _color_g;
@@ -592,13 +685,22 @@ static int ws2812_vleds_probe(struct spi_device *spi)
     _ledctx->cls_red = _ledcls_red;
     _ledctx->cls_green = _ledcls_green;
     _ledctx->cls_blue = _ledcls_blue;
+#endif
+
+    // put the node on the list BEFORE registering: once registered, a
+    // trigger (e.g. netdev/default-trigger) may call the brightness callback
+    // at any time and the callback looks the led up in this list
+    list_add_tail(&_ledctx->list, &_drv_data->leds);
+
+    led_classdev_register(&spi->dev, _ledcls);
+    dev_info(&spi->dev, "registering led: %s\n", _label);
+
+#ifdef CONFIG_WS2812_VLEDS_CHANNEL_CONTROL
     led_classdev_register(&spi->dev, _ledcls_red);
     led_classdev_register(&spi->dev, _ledcls_green);
     led_classdev_register(&spi->dev, _ledcls_blue);
     dev_info(&spi->dev, "registering rgb leds: %s, %s, %s\n", _red_name, _green_name, _blue_name);
 #endif
-
-    list_add_tail(&_ledctx->list, &_drv_data->leds);
   }
 
   return 0;
@@ -612,10 +714,8 @@ static int ws2812_vleds_remove(struct spi_device *spi) {
 
   if (_drv_data) {
 
-    // clear leds
-    ws2812_clear(_drv_data->ws_opctx, ws2812_rgb(0, 0, 0));
-    ws2812_vleds_update(_drv_data);
-
+    // unregister first: this stops triggers/blinking and flushes their
+    // pending brightness work, so nothing can queue new updates afterwards
     list_for_each_entry_safe(_node, _tmp, &_drv_data->leds, list) {
       if (_node->cls) {
         led_classdev_unregister(_node->cls);
@@ -635,6 +735,11 @@ static int ws2812_vleds_remove(struct spi_device *spi) {
 
       list_del(&_node->list);
     }
+
+    // stop the rate-limited flusher, then blank the chain synchronously
+    cancel_delayed_work_sync(&_drv_data->flush_work);
+    ws2812_clear(_drv_data->ws_opctx, ws2812_rgb(0, 0, 0));
+    ws2812_vleds_update(_drv_data);
   }
 
   pr_info("virtual leds removed for %s\n", dev_name(&spi->dev));
